@@ -1,0 +1,442 @@
+// Invoicely data model.
+//
+// Conventions
+//  - Every id is a UUID; internal ids never appear in public URLs (public invoices use `publicToken`,
+//    the API uses prefixed public ids derived from `publicId`).
+//  - Every tenant-owned row carries `businessId` so authorization is a single indexed predicate.
+//  - Money is stored as Decimal and computed in integer minor units in application code.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  USER
+  DEVELOPER
+  ADMIN
+}
+
+enum TokenType {
+  EMAIL_VERIFICATION
+  PASSWORD_RESET
+}
+
+enum InvoiceStatus {
+  DRAFT
+  SENT
+  PENDING
+  PAID
+  OVERDUE
+  CANCELLED
+}
+
+enum DiscountType {
+  PERCENT
+  FIXED
+}
+
+enum TemplateLayout {
+  MODERN
+  MINIMAL
+  CORPORATE
+  CLASSIC
+}
+
+enum ApiKeyMode {
+  TEST
+  LIVE
+}
+
+enum DeliveryStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+model User {
+  id              String    @id @default(uuid()) @db.Uuid
+  email           String    @unique
+  name            String
+  passwordHash    String?
+  image           String?
+  role            Role      @default(USER)
+  emailVerifiedAt DateTime?
+  themePreference String    @default("system")
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  accounts      Account[]
+  sessions      Session[]
+  tokens        VerificationToken[]
+  businesses    Business[]
+  apiKeys       ApiKey[]
+  notifications Notification[]
+  auditLogs     AuditLog[]
+
+  @@index([role])
+}
+
+// OAuth-ready: providers (Google, GitHub, ...) attach here without touching User.
+model Account {
+  id                String   @id @default(uuid()) @db.Uuid
+  userId            String   @db.Uuid
+  provider          String
+  providerAccountId String
+  createdAt         DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+// Opaque, server-side sessions. Only a SHA-256 hash of the cookie token is stored.
+model Session {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @db.Uuid
+  tokenHash  String   @unique
+  userAgent  String?
+  ipAddress  String?
+  remember   Boolean  @default(false)
+  expiresAt  DateTime
+  lastUsedAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model VerificationToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  type      TokenType
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+}
+
+// One business per user in the MVP. `ownerId` is intentionally not unique so
+// multiple businesses (Phase 3) need no schema change; the app resolves the
+// "current" business per user.
+model Business {
+  id                   String   @id @default(uuid()) @db.Uuid
+  ownerId              String   @db.Uuid
+  name                 String
+  logoKey              String?
+  signatureKey         String?
+  email                String?
+  phone                String?
+  website              String?
+  taxId                String?
+  addressLine1         String?
+  addressLine2         String?
+  city                 String?
+  region               String?
+  postalCode           String?
+  country              String?
+  paymentInfo          String?
+  defaultCurrency      String   @default("USD")
+  defaultPaymentTerms  Int      @default(14)
+  defaultTaxRate       Decimal  @default(0) @db.Decimal(5, 2)
+  defaultNotes         String?
+  defaultFooter        String?
+  invoicePrefix        String   @default("INV-")
+  invoiceNumberPadding Int      @default(4)
+  nextInvoiceNumber    Int      @default(1)
+  defaultTemplateId    String?  @db.Uuid
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  owner     User              @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  clients   Client[]
+  products  Product[]
+  invoices  Invoice[]
+  templates InvoiceTemplate[]
+  webhooks  Webhook[]
+  apiKeys   ApiKey[]
+
+  @@index([ownerId])
+}
+
+model Client {
+  id           String   @id @default(uuid()) @db.Uuid
+  publicId     String   @unique @default(dbgenerated("replace(gen_random_uuid()::text, '-', '')"))
+  businessId   String   @db.Uuid
+  name         String
+  company      String?
+  email        String?
+  phone        String?
+  addressLine1 String?
+  addressLine2 String?
+  city         String?
+  region       String?
+  postalCode   String?
+  country      String?
+  taxId        String?
+  notes        String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  business Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  invoices Invoice[]
+
+  @@index([businessId, name])
+  @@index([businessId, email])
+}
+
+model Product {
+  id          String   @id @default(uuid()) @db.Uuid
+  publicId    String   @unique @default(dbgenerated("replace(gen_random_uuid()::text, '-', '')"))
+  businessId  String   @db.Uuid
+  name        String
+  description String?
+  sku         String?
+  unitPrice   Decimal  @db.Decimal(14, 2)
+  taxRate     Decimal  @default(0) @db.Decimal(5, 2)
+  currency    String   @default("USD")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  business Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  items    InvoiceItem[]
+
+  @@unique([businessId, sku])
+  @@index([businessId, name])
+}
+
+// System templates have businessId = null and isSystem = true.
+// `config` holds the customization payload (colors, font, toggles) validated by Zod.
+model InvoiceTemplate {
+  id         String         @id @default(uuid()) @db.Uuid
+  businessId String?        @db.Uuid
+  name       String
+  layout     TemplateLayout
+  config     Json
+  isSystem   Boolean        @default(false)
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+
+  business Business?  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  invoices Invoice[]
+
+  @@index([businessId])
+}
+
+model Invoice {
+  id         String  @id @default(uuid()) @db.Uuid
+  // Stable public identifier used by the REST API as `inv_<publicId>`.
+  publicId   String  @unique @default(dbgenerated("replace(gen_random_uuid()::text, '-', '')"))
+  businessId String  @db.Uuid
+  clientId   String? @db.Uuid
+  templateId String? @db.Uuid
+
+  number    String
+  reference String?
+  status    InvoiceStatus @default(DRAFT)
+
+  issueDate    DateTime @db.Date
+  dueDate      DateTime @db.Date
+  paymentTerms Int      @default(14)
+  currency     String   @default("USD")
+
+  discountType  DiscountType @default(PERCENT)
+  discountValue Decimal      @default(0) @db.Decimal(14, 2)
+  shipping      Decimal      @default(0) @db.Decimal(14, 2)
+
+  subtotal      Decimal @default(0) @db.Decimal(14, 2)
+  discountTotal Decimal @default(0) @db.Decimal(14, 2)
+  taxTotal      Decimal @default(0) @db.Decimal(14, 2)
+  total         Decimal @default(0) @db.Decimal(14, 2)
+  amountPaid    Decimal @default(0) @db.Decimal(14, 2)
+
+  notes  String?
+  terms  String?
+  footer String?
+
+  // Snapshots keep issued invoices stable if the business or client is edited later.
+  businessSnapshot Json
+  clientSnapshot   Json
+  design           Json
+
+  // Random 256-bit token; null means sharing is off / revoked.
+  publicToken    String?   @unique
+  publicShareAt  DateTime?
+  sentAt         DateTime?
+  paidAt         DateTime?
+  cancelledAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  business Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  client   Client?          @relation(fields: [clientId], references: [id], onDelete: SetNull)
+  template InvoiceTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  items    InvoiceItem[]
+  payments InvoicePayment[]
+
+  @@unique([businessId, number])
+  @@index([businessId, status])
+  @@index([businessId, issueDate])
+  @@index([businessId, dueDate])
+  @@index([businessId, createdAt])
+  @@index([clientId])
+}
+
+model InvoiceItem {
+  id           String  @id @default(uuid()) @db.Uuid
+  invoiceId    String  @db.Uuid
+  productId    String? @db.Uuid
+  position     Int
+  description  String
+  quantity     Decimal @db.Decimal(12, 3)
+  unitPrice    Decimal @db.Decimal(14, 2)
+  taxRate      Decimal @default(0) @db.Decimal(5, 2)
+  discountRate Decimal @default(0) @db.Decimal(5, 2)
+  lineTotal    Decimal @db.Decimal(14, 2)
+
+  invoice Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  product Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@index([invoiceId, position])
+  @@index([productId])
+}
+
+model InvoicePayment {
+  id        String   @id @default(uuid()) @db.Uuid
+  invoiceId String   @db.Uuid
+  amount    Decimal  @db.Decimal(14, 2)
+  method    String?
+  reference String?
+  note      String?
+  paidAt    DateTime @default(now())
+  createdAt DateTime @default(now())
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+}
+
+// Only a SHA-256 digest of the secret is stored. The publishable key is not secret.
+model ApiKey {
+  id          String     @id @default(uuid()) @db.Uuid
+  userId      String     @db.Uuid
+  businessId  String     @db.Uuid
+  name        String
+  mode        ApiKeyMode
+  publishable String     @unique
+  secretHash  String     @unique
+  secretLast4 String
+  revokedAt   DateTime?
+  lastUsedAt  DateTime?
+  createdAt   DateTime   @default(now())
+
+  user     User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  business Business     @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  requests ApiRequest[]
+
+  @@index([userId])
+  @@index([businessId])
+}
+
+model ApiRequest {
+  id         String   @id @default(uuid()) @db.Uuid
+  apiKeyId   String   @db.Uuid
+  method     String
+  path       String
+  statusCode Int
+  durationMs Int
+  createdAt  DateTime @default(now())
+
+  apiKey ApiKey @relation(fields: [apiKeyId], references: [id], onDelete: Cascade)
+
+  @@index([apiKeyId, createdAt])
+}
+
+// Signing secrets must be readable to sign payloads, so they are stored AES-GCM encrypted.
+model Webhook {
+  id              String   @id @default(uuid()) @db.Uuid
+  publicId        String   @unique @default(dbgenerated("replace(gen_random_uuid()::text, '-', '')"))
+  businessId      String   @db.Uuid
+  url             String
+  description     String?
+  events          String[]
+  enabled         Boolean  @default(true)
+  secretEncrypted String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  business Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  events_  WebhookEvent[]
+
+  @@index([businessId])
+}
+
+model WebhookEvent {
+  id            String         @id @default(uuid()) @db.Uuid
+  webhookId     String         @db.Uuid
+  type          String
+  payload       Json
+  status        DeliveryStatus @default(PENDING)
+  attempts      Int            @default(0)
+  responseCode  Int?
+  error         String?
+  lastAttemptAt DateTime?
+  createdAt     DateTime       @default(now())
+
+  webhook Webhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+
+  @@index([webhookId, createdAt])
+  @@index([status])
+}
+
+model Notification {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  title     String
+  body      String?
+  link      String?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@index([userId, createdAt])
+}
+
+model AuditLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String?  @db.Uuid
+  action    String
+  entity    String
+  entityId  String?
+  meta      Json?
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([entity, entityId])
+}
+
+// Fixed-window counters in Postgres so rate limits hold across server instances.
+model RateLimitBucket {
+  key         String
+  windowStart DateTime
+  count       Int      @default(0)
+
+  @@id([key, windowStart])
+  @@index([windowStart])
+}
